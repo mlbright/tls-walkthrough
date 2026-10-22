@@ -210,14 +210,14 @@ sig_check() {
   local alg md="" kind=""
   alg=$(ctext "$child" | awk -F': ' '/Signature Algorithm:/ { print $2; exit }')
   case "$alg" in
-  *[Ww]ith[Rr][Ss][Aa]*) kind=pkcs1 ;;
-  ecdsa-with-*) kind=ecdsa ;;
-  rsassaPss) kind=pss ;;
-  ED25519 | ED448) kind=eddsa ;;
+    *[Ww]ith[Rr][Ss][Aa]*) kind=pkcs1 ;;
+    ecdsa-with-*) kind=ecdsa ;;
+    rsassaPss) kind=pss ;;
+    ED25519 | ED448) kind=eddsa ;;
   esac
   case "$alg" in
-  *[Ss][Hh][Aa]1[Ww]* | *SHA1) md=sha1 ;;
-  *256*) md=sha256 ;; *384*) md=sha384 ;; *512*) md=sha512 ;;
+    *[Ss][Hh][Aa]1[Ww]* | *SHA1) md=sha1 ;;
+    *256*) md=sha256 ;; *384*) md=sha384 ;; *512*) md=sha512 ;;
   esac
   [ "$kind" = pss ] && md=$(ctext "$child" | awk '/Hash Algorithm:/ { print $3; exit }')
 
@@ -251,17 +251,17 @@ sig_check() {
 
   local ok=1
   case "$kind" in
-  pkcs1 | ecdsa)
-    "$OPENSSL" dgst "-$md" -verify "$t.pub" -signature "$t.sig" "$t.tbs" >/dev/null 2>&1 && ok=0
-    ;;
-  pss)
-    "$OPENSSL" dgst "-$md" -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:auto \
-      -verify "$t.pub" -signature "$t.sig" "$t.tbs" >/dev/null 2>&1 && ok=0
-    ;;
-  eddsa)
-    "$OPENSSL" pkeyutl -verify -pubin -inkey "$t.pub" -rawin -in "$t.tbs" -sigfile "$t.sig" >/dev/null 2>&1 && ok=0
-    ;;
-  *) [ "$verbose" = 1 ] && note "      (signature algorithm '$alg' not handled by this script)" ;;
+    pkcs1 | ecdsa)
+      "$OPENSSL" dgst "-$md" -verify "$t.pub" -signature "$t.sig" "$t.tbs" >/dev/null 2>&1 && ok=0
+      ;;
+    pss)
+      "$OPENSSL" dgst "-$md" -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:auto \
+        -verify "$t.pub" -signature "$t.sig" "$t.tbs" >/dev/null 2>&1 && ok=0
+      ;;
+    eddsa)
+      "$OPENSSL" pkeyutl -verify -pubin -inkey "$t.pub" -rawin -in "$t.tbs" -sigfile "$t.sig" >/dev/null 2>&1 && ok=0
+      ;;
+    *) [ "$verbose" = 1 ] && note "      (signature algorithm '$alg' not handled by this script)" ;;
   esac
   [ "$md" = sha1 ] && [ "$verbose" = 1 ] && note "      SHA-1 signatures are rejected by modern clients"
   return $ok
@@ -793,8 +793,8 @@ while [ "$d" -lt "$NPATH" ]; do
   else
     # CA rules.
     case "$bc" in
-    *CA:TRUE*) pass "basicConstraints CA:TRUE" ;;
-    *) if [ "$c" = "$ANCHOR" ]; then warn "trust anchor has no CA:TRUE (old v1 root; trusted anyway)"; else fail "intermediate lacks CA:TRUE: it may not issue certificates"; fi ;;
+      *CA:TRUE*) pass "basicConstraints CA:TRUE" ;;
+      *) if [ "$c" = "$ANCHOR" ]; then warn "trust anchor has no CA:TRUE (old v1 root; trusted anyway)"; else fail "intermediate lacks CA:TRUE: it may not issue certificates"; fi ;;
     esac
     case "$bc" in *pathlen:*)
       pl=$(echo "$bc" | sed -E 's/.*pathlen:([0-9]+).*/\1/')
@@ -971,46 +971,46 @@ if [ -n "$CV" ]; then
   printf '%s' "$sighex" | hex2bin >"$W/cv-sig.bin"
   "$OPENSSL" x509 -in "$LEAF" -noout -pubkey >"$W/leaf.pub"
   case "$scheme" in
-  0403)
-    sname=ecdsa_secp256r1_sha256
-    vcmd="dgst -sha256"
-    ;;
-  0503)
-    sname=ecdsa_secp384r1_sha384
-    vcmd="dgst -sha384"
-    ;;
-  0603)
-    sname=ecdsa_secp521r1_sha512
-    vcmd="dgst -sha512"
-    ;;
-  0804 | 0809)
-    sname=rsa_pss_sha256
-    vcmd="dgst -sha256 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:digest"
-    ;;
-  0805 | 080a)
-    sname=rsa_pss_sha384
-    vcmd="dgst -sha384 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:digest"
-    ;;
-  0806 | 080b)
-    sname=rsa_pss_sha512
-    vcmd="dgst -sha512 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:digest"
-    ;;
-  0807)
-    sname=ed25519
-    vcmd="pkeyutl"
-    ;;
-  0808)
-    sname=ed448
-    vcmd="pkeyutl"
-    ;;
-  0904 | 0905 | 0906)
-    sname=mldsa
-    vcmd="pkeyutl"
-    ;;
-  *)
-    sname="0x$scheme"
-    vcmd=""
-    ;;
+    0403)
+      sname=ecdsa_secp256r1_sha256
+      vcmd="dgst -sha256"
+      ;;
+    0503)
+      sname=ecdsa_secp384r1_sha384
+      vcmd="dgst -sha384"
+      ;;
+    0603)
+      sname=ecdsa_secp521r1_sha512
+      vcmd="dgst -sha512"
+      ;;
+    0804 | 0809)
+      sname=rsa_pss_sha256
+      vcmd="dgst -sha256 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:digest"
+      ;;
+    0805 | 080a)
+      sname=rsa_pss_sha384
+      vcmd="dgst -sha384 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:digest"
+      ;;
+    0806 | 080b)
+      sname=rsa_pss_sha512
+      vcmd="dgst -sha512 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:digest"
+      ;;
+    0807)
+      sname=ed25519
+      vcmd="pkeyutl"
+      ;;
+    0808)
+      sname=ed448
+      vcmd="pkeyutl"
+      ;;
+    0904 | 0905 | 0906)
+      sname=mldsa
+      vcmd="pkeyutl"
+      ;;
+    *)
+      sname="0x$scheme"
+      vcmd=""
+      ;;
   esac
   echo
   kv "signature scheme" "$sname (0x$scheme)"
