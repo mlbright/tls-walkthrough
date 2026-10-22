@@ -13,26 +13,46 @@
 #                               (SNI and name checks still use <host>)
 #     HTTP_METHOD=GET           request sent after the handshake (default HEAD)
 #     TIMEOUT=15                seconds per network operation
+#     PAUSE=0                   never pause (it only pauses in a terminal anyway)
 #
-# What it does
-#   1. Opens ONE TLS 1.3 connection with `openssl s_client`, recording:
-#        -msg         every TLS record header and every handshake message, as
-#                     raw bytes (OpenSSL prints the encrypted handshake
-#                     messages after decrypting them)
-#        -keylogfile  the traffic secrets (NSS key log format, like SSLKEYLOGFILE)
-#        -sess_out    the session ticket, for the resumption demo
-#   2. Decodes ClientHello / ServerHello / EncryptedExtensions / Certificate /
-#      CertificateVerify / Finished / NewSessionTicket from those bytes.
-#   3. Validates the certificate chain step by step (RFC 5280 §6, simplified):
-#      path building, each signature checked by hand, validity, basic
-#      constraints, key usage, EKU, path length, hostname, revocation, CT.
-#   4. Re-verifies the server's CertificateVerify signature (proof that it holds
-#      the leaf's private key) and both Finished MACs (proof that both sides saw
-#      the same transcript and derived the same keys) from the captured bytes.
-#   5. Reconnects with the session ticket: PSK resumption, no certificates.
-#   6. Times DNS / TCP / TLS with curl.
+# Pausing
+#   Run in a terminal, the walkthrough stops after every step (each numbered
+#   section and each subsection), shows a "What just happened" recap, and waits:
+#     Enter  next step     s  skip to the next section
+#     c      run to the end without stopping     q  quit (exit status 130)
+#   Piped or redirected, it never stops, but the recaps are still printed, so
+#   `./tls13-walkthrough.sh > run.txt` gives a complete annotated transcript.
 #
-# Exit status: 0 = every check passed, 1 = at least one FAIL, 2 = could not run.
+# The sections
+#    1. Prerequisites       openssl version, trust store
+#    2. DNS                 name -> address (not protected by TLS)
+#    3. Handshake           ONE TLS 1.3 connection with `openssl s_client`, recording
+#                           every record and handshake message as raw bytes (-msg;
+#                           OpenSSL prints encrypted ones after decrypting them), the
+#                           traffic secrets (-keylogfile), the session ticket (-sess_out).
+#                           Everything up to section 11 takes those bytes apart.
+#    4. ClientHello         \
+#    5. ServerHello          | decoded byte by byte from the capture
+#    6. Key schedule         | (RFC 8446)
+#    7. EncryptedExtensions /
+#    8. Certificate         the chain, validated by hand (RFC 5280 §6, simplified):
+#                           path building, each signature, validity, basic constraints,
+#                           key usage, EKU, path length, hostname, revocation, CT
+#    9. CertificateVerify   proof the server holds the leaf's private key
+#   10. Finished            proof both sides saw the same handshake and derived the same keys
+#   11. After the handshake application data, session tickets
+#   12. Resumption          a second connection using the ticket: no certificates
+#   13. Timing              DNS / TCP / TLS with curl
+#   14. Summary
+#
+# Try these next (public test sites that speak TLS 1.3 and fail on purpose):
+#   ./tls13-walkthrough.sh expired-isrgrootx1.letsencrypt.org   expired leaf
+#   ./tls13-walkthrough.sh revoked-isrgrootx1.letsencrypt.org   revoked leaf
+#   ./tls13-walkthrough.sh expired-rsa-dv.ssl.com               expired leaf, another CA
+#   ./tls13-walkthrough.sh revoked-rsa-dv.ssl.com               revoked leaf, another CA
+#
+# Exit status: 0 = every check passed, 1 = at least one FAIL, 2 = could not run,
+#              130 = quit at a pause (q) or interrupted (Ctrl-C).
 # Everything it captured stays in a temp directory printed at the end. Note that
 # keylog.txt can decrypt a packet capture of that session — delete it when done.
 #
@@ -59,6 +79,7 @@ if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
   GRN=$'\033[32m'
   YEL=$'\033[33m'
   CYN=$'\033[36m'
+  MAG=$'\033[35m'
   RST=$'\033[0m'
 else
   BOLD=""
@@ -67,8 +88,14 @@ else
   GRN=""
   YEL=""
   CYN=""
+  MAG=""
   RST=""
 fi
+
+# Pause only when someone is at a terminal to press a key.
+PAUSING=0
+if [ "${PAUSE:-1}" != 0 ] && [ -t 0 ] && [ -t 1 ]; then PAUSING=1; fi
+SKIP_SECTION=0 # set by "s": no more pauses until the next section
 
 W=$(mktemp -d "${TMPDIR:-/tmp}/tls13-walkthrough.XXXXXX") || {
   echo "mktemp failed" >&2
@@ -78,12 +105,28 @@ RESULTS="$W/results.txt"
 : >"$RESULTS"
 
 STEP=0
+STEP_TITLE=""
+# Verdicts within the current step, so its recap can explain them.
+STEP_FAILS=0
+STEP_WARNS=0
+STEP_SKIPS=0
+step_start() {
+  STEP_TITLE=$1
+  STEP_FAILS=0
+  STEP_WARNS=0
+  STEP_SKIPS=0
+}
 section() {
   STEP=$((STEP + 1))
+  SKIP_SECTION=0
+  step_start "[$STEP] $*"
   printf '\n%s%s[%d] %s%s\n' "$BOLD" "$CYN" "$STEP" "$*" "$RST"
 }
-subsection() { printf '\n   %s%s%s\n' "$BOLD" "$*" "$RST"; }
-note() { printf '   %s%s%s\n' "$DIM" "$*" "$RST"; } # explanation lines
+subsection() {
+  step_start "[$STEP] $*"
+  printf '\n   %s%s%s\n' "$BOLD" "$*" "$RST"
+}
+note() { printf '   %s%s%s\n' "$DIM" "$*" "$RST"; } # intro lines
 kv() { printf '     %-26s %s\n' "$1" "$2"; }        # key/value lines
 pass() {
   printf '   %s[PASS]%s %s\n' "$GRN" "$RST" "$*"
@@ -92,14 +135,73 @@ pass() {
 fail() {
   printf '   %s[FAIL]%s %s\n' "$RED" "$RST" "$*"
   echo "FAIL|$*" >>"$RESULTS"
+  STEP_FAILS=$((STEP_FAILS + 1))
 }
 warn() {
   printf '   %s[WARN]%s %s\n' "$YEL" "$RST" "$*"
   echo "WARN|$*" >>"$RESULTS"
+  STEP_WARNS=$((STEP_WARNS + 1))
 }
 skip() {
   printf '   %s[SKIP]%s %s\n' "$DIM" "$RST" "$*"
   echo "SKIP|$*" >>"$RESULTS"
+  STEP_SKIPS=$((STEP_SKIPS + 1))
+}
+
+# recap_text LINE... — the "What just happened" block that ends a step: one
+# argument per line, written for someone who has never looked inside a
+# handshake. Adds a line for any FAIL / WARN / SKIP in the step.
+recap_text() {
+  printf '\n   %s%s> What just happened%s\n' "$BOLD" "$MAG" "$RST"
+  # The arguments are re-flowed, so values of any length fit: a line starting
+  # "- " opens a bullet, a line starting with spaces continues it, and any other
+  # line continues the current paragraph (or starts one after a bullet).
+  printf '%s\n' "$@" | awk -v W=84 '
+    function wrap(s, b,   n, w, i, line, pre) {
+      n = split(s, w, " "); line = ""; pre = ""
+      for (i = 1; i <= n; i++) {
+        if (line != "" && length(pre line " " w[i]) > W) { print "     " pre line; line = w[i]; pre = b ? "  " : "" }
+        else line = (line == "" ? w[i] : line " " w[i])
+      }
+      if (line != "") print "     " pre line
+    }
+    function flush() { if (item != "") wrap(item, bul); item = "" }
+    /^- / { flush(); item = $0; bul = 1; next }
+    /^ /  { sub(/^ +/, ""); item = item " " $0; next }
+    { if (bul) { flush(); bul = 0 }; item = (item == "" ? $0 : item " " $0) }
+    END { flush() }'
+  if [ "$STEP_FAILS" -gt 0 ]; then
+    printf '     %sA real client would have aborted the connection at that FAIL: a browser shows%s\n' "$RED" "$RST"
+    printf '     %s"Your connection is not private" and sends nothing more. The walkthrough keeps%s\n' "$RED" "$RST"
+    printf '     %sgoing anyway so you can see the remaining checks.%s\n' "$RED" "$RST"
+  fi
+  if [ "$STEP_WARNS" -gt 0 ]; then
+    printf '     %sWARN means most clients accept this anyway; the WARN line says what to watch for.%s\n' "$YEL" "$RST"
+  fi
+  if [ "$STEP_SKIPS" -gt 0 ]; then
+    printf '     %sSKIP means the check could not run here; the SKIP line says why.%s\n' "$DIM" "$RST"
+  fi
+}
+# recap LINE... — print the recap, then wait for the learner.
+recap() {
+  recap_text "$@"
+  pause_point
+}
+pause_point() {
+  [ "$PAUSING" = 1 ] && [ "$SKIP_SECTION" = 0 ] || return 0
+  local prompt key
+  prompt="   -- Enter: next step | s: skip to next section | c: run to the end | q: quit "
+  printf '\n%s%s%s' "$DIM" "$prompt" "$RST"
+  IFS= read -rsn1 key </dev/tty || key=c
+  printf '\r%*s\r' "${#prompt}" ''
+  case "$key" in
+    s | S) SKIP_SECTION=1 ;;
+    c | C) PAUSING=0 ;;
+    q | Q)
+      printf '   Stopped after %s.\n   Artifacts so far: %s\n' "$STEP_TITLE" "$W"
+      exit 130
+      ;;
+  esac
 }
 die() {
   printf '%sERROR:%s %s\n' "$RED" "$RST" "$*" >&2
@@ -479,7 +581,8 @@ else
   done
 fi
 [ -n "$CA" ] && [ -s "$CA" ] || die "no CA bundle found; set CAFILE=/path/to/bundle.pem"
-kv "trust store" "$CA ($(grep -c 'BEGIN CERTIFICATE' "$CA") roots)"
+NROOTS=$(grep -c 'BEGIN CERTIFICATE' "$CA")
+kv "trust store" "$CA ($NROOTS roots)"
 kv "target" "https://$HOST:$PORT/  (TCP to $CONNECT_TO)"
 kv "work dir" "$W"
 
@@ -489,6 +592,14 @@ EXTRA_OPTS=""
 "$OPENSSL" s_client -help 2>&1 | grep -q -- '-no_rx_cert_comp' && EXTRA_OPTS="-no_rx_cert_comp"
 # s_client checks the chain but, unlike a browser, checks the name only if asked.
 if echo "$HOST" | grep -Eq '^[0-9.]+$|:'; then N_OPT="-verify_ip $HOST"; else N_OPT="-verify_hostname $HOST"; fi
+
+recap "Nothing has touched the network yet. Two things were set up:" \
+  "- the tool: openssl, which this script drives to send, decode and verify bytes;" \
+  "- the trust store: $NROOTS root certificates that came with your system. A root" \
+  "  certificate belongs to a certificate authority (CA), a company whose job is to" \
+  "  vouch that a public key belongs to a website. Your machine trusts exactly these" \
+  "  roots, chosen in advance. Later, $HOST will have to show a chain of signatures" \
+  "  leading back to one of them, or nothing it says can be believed."
 
 # =============================================================================
 # [2] DNS
@@ -508,6 +619,10 @@ elif command -v dig >/dev/null 2>&1; then
     dig +short AAAA "$CHOST"
   } | while read -r a; do kv "address" "$a"; done
 else note "(no getent/dig; openssl will resolve it)"; fi
+recap "The name $CHOST was turned into one or more IP addresses. TLS can only protect a" \
+  "connection that already exists, so this lookup, and the TCP connection that comes" \
+  "next, travel unencrypted: anyone on the network path can see which server you are" \
+  "contacting. TLS will hide WHAT you say to it, not THAT you are talking to it."
 
 # =============================================================================
 # [3] One TLS 1.3 connection, fully recorded
@@ -528,7 +643,8 @@ run_timeout "$TIMEOUT" "$W/request.txt" "$OPENSSL" s_client -connect "$CONNECT_T
   -tls1_3 -alpn http/1.1 -CAfile "$CA" $N_OPT -status -showcerts -ign_eof $EXTRA_OPTS \
   -msg -msgfile "$W/msg.log" -keylogfile "$W/keylog.txt" -sess_out "$W/session.pem" \
   >"$W/s_client.txt" 2>&1
-if ! grep -Eq 'New, TLSv1\.3|Protocol *: TLSv1\.3' "$W/s_client.txt"; then
+# "Protocol: TLSv1.3" also appears when the handshake fails, so require a cipher.
+if ! grep -Eq 'New, TLSv1\.3, Cipher is [A-Z]' "$W/s_client.txt"; then
   echo
   tail -20 "$W/s_client.txt" | sed 's/^/     /'
   die "no TLS 1.3 handshake with $CONNECT_TO (see above)"
@@ -536,6 +652,12 @@ fi
 parse_msglog "$W/msg.log" "$W/records.tsv" "$W/handshake.tsv"
 HS="$W/handshake.tsv"
 pass "TLS 1.3 handshake completed ($(grep -m1 -o 'Cipher is [A-Z0-9_]*' "$W/s_client.txt"))"
+NHSMSG=$(wc -l <"$HS" | tr -d ' ')
+recap "The whole conversation with $HOST has already happened, in one go: openssl connected," \
+  "did the TLS handshake, sent an HTTP $HTTP_METHOD request, read the reply and hung up." \
+  "Along the way it recorded $NHSMSG handshake messages as raw bytes, plus the secret keys." \
+  "From here until section 11 nothing more is sent: each step takes those recorded bytes" \
+  "apart and re-does one of the checks your browser does silently on every HTTPS visit."
 
 subsection "Record-by-record timeline"
 note "Every TLS record has a 5-byte header: type, legacy version, length."
@@ -547,6 +669,15 @@ print_timeline "$W/records.tsv"
 echo
 note "The ChangeCipherSpec records are no-ops (RFC 8446 D.4). They make the exchange look like"
 note "TLS 1.2 session resumption so middleboxes don't break it."
+recap "Read the table top to bottom: it is the conversation, one TLS record per row." \
+  "- Only the first records (the two Hellos) are readable by an eavesdropper. Every" \
+  "  record after ServerHello says 'AppData' on the outside; its true type is hidden" \
+  "  inside the encryption, shown here after the arrow." \
+  "- 'protected by' shows which key encrypted each record. Each side switches from its" \
+  "  handshake key to its application key right after sending its own Finished." \
+  "- The client speaks, the server answers, and the client sends its Finished and its" \
+  "  HTTP request back to back: the handshake cost a single round trip. That is TLS 1.3's" \
+  "  headline improvement over TLS 1.2, which needed two."
 
 # =============================================================================
 # [4] ClientHello
@@ -558,8 +689,21 @@ note "finish in one round trip."
 CH=$(hs_hex "$HS" ClientHello 'C->S')
 [ -n "$CH" ] || die "ClientHello not found in the capture"
 echo
-decode_hello CH "$CH"
+CH_DEC=$(decode_hello CH "$CH")
+printf '%s\n' "$CH_DEC"
 CRANDOM=${CH:12:64} # bytes 6..37, identifies this session in the key log
+# "X25519MLKEM768 (1216-byte key ...); x25519 (32-byte key ...)" -> "X25519MLKEM768; x25519"
+CH_SHARES=$(printf '%s\n' "$CH_DEC" | sed -nE 's/^ +key_share +//p' | sed -E 's/ \([^)]*\)//g')
+recap "The client's opening message, sent in the clear. The lines to notice:" \
+  "- server_name: '$HOST' travels unencrypted, so the server can pick the right" \
+  "  certificate (one IP address often hosts many sites). Observers can read it too." \
+  "- supported_versions: the real version offer. legacy_version still says TLS 1.2" \
+  "  because some old network boxes break on anything they don't recognise." \
+  "- key_share: ${CH_SHARES:-(none)}. These are ephemeral ('use once, then discard')" \
+  "  public keys, sent before the server has said anything. The client is guessing which" \
+  "  key-agreement method the server will choose; a right guess saves a round trip." \
+  "- the client's random value: fresh for every connection, so no recording of an old" \
+  "  handshake can be replayed against this one."
 
 # =============================================================================
 # [5] ServerHello
@@ -595,6 +739,25 @@ case "$SUITE" in 1302)
 esac
 TH_MD_UP=$(echo "$TH_MD" | tr a-z A-Z)
 note "Cipher suite 0x$SUITE fixes the transcript hash and HKDF hash: $TH_MD."
+SH_DEC=$(decode_hello SH "$SH")
+SUITE_NAME=$(printf '%s\n' "$SH_DEC" | sed -nE 's/^ +cipher_suite +([^ ]+).*/\1/p')
+SH_GROUP=$(printf '%s\n' "$SH_DEC" | sed -nE 's/^ +key_share +([^,]+),.*/\1/p')
+HRR_LINES=()
+if [ "$IS_HRR" = 1 ]; then
+  HRR_LINES=("- This run needed a HelloRetryRequest first: none of the client's guessed key shares"
+    "  suited the server, so it asked for a $SH_GROUP one and the client started over."
+    "  That cost an extra round trip; it is exactly what the guessing tries to avoid.")
+fi
+recap "The server's reply, also in the clear. It made its choices:" \
+  "- cipher suite ${SUITE_NAME:-0x$SUITE}: the encryption for everything that follows," \
+  "  and the hash function ($TH_MD) used to fingerprint the handshake (the 'transcript')." \
+  "- key share: ${SH_GROUP:-?}. The server sent its own ephemeral public key. Combining" \
+  "  it with the client's gives both sides the same shared secret, without that secret" \
+  "  ever crossing the network: an eavesdropper who saw both public keys still can't" \
+  "  compute it. Because the keys are thrown away afterwards, stealing the server's" \
+  "  long-term key later can't decrypt this session ('forward secrecy')." \
+  ${HRR_LINES[@]+"${HRR_LINES[@]}"} \
+  "From this message on, everything is encrypted."
 
 # =============================================================================
 # [6] Key schedule
@@ -618,6 +781,14 @@ if [ -s "$W/keylog.txt" ]; then
 else
   warn "no key log written"
 fi
+recap "Both sides computed these secrets independently, from the shared secret of the" \
+  "previous step; none of them was ever sent. They are visible here only because we" \
+  "asked openssl to write them to a file (browsers do the same when SSLKEYLOGFILE is set)." \
+  "HKDF, the function in the recipe above, mixes a secret with a label and stretches it" \
+  "into new, independent keys. So there is a separate key for each direction and each" \
+  "phase: the handshake secrets protect the rest of the handshake, the *_TRAFFIC_SECRET_0" \
+  "ones protect the HTTP request and reply. Section 10 uses the handshake secrets to" \
+  "check both sides' Finished messages."
 
 # =============================================================================
 # [7] EncryptedExtensions
@@ -627,7 +798,19 @@ note "Everything not needed to set up keys moves here, under the server handshak
 note "(ALPN, for example), so passive observers can't see it."
 EE=$(hs_hex "$HS" EncryptedExtensions 'S->C')
 echo
-decode_hello EE "$EE"
+EE_DEC=$(decode_hello EE "$EE")
+printf '%s\n' "$EE_DEC"
+EE_ALPN=$(printf '%s\n' "$EE_DEC" | sed -nE 's/^ +alpn +//p')
+if [ -n "$EE_ALPN" ]; then
+  ALPN_LINE="The alpn line says both sides agreed to speak $EE_ALPN inside the encrypted tunnel."
+else
+  ALPN_LINE="This server sent no alpn line, so the client simply assumes HTTP/1.1."
+fi
+recap "This is the first message an eavesdropper can no longer read: it was encrypted with" \
+  "the server's handshake key. It holds the server's answers to the client's remaining" \
+  "requests. $ALPN_LINE" \
+  "In TLS 1.2 these answers, and the server's certificate coming next, were readable" \
+  "by anyone on the network."
 
 # =============================================================================
 # [8] Certificate + path validation
@@ -654,6 +837,17 @@ else
 fi
 [ "${NCERTS:-0}" -gt 0 ] || die "no certificates received"
 LEAF="$W/chain-0.pem"
+if [ -s "$W/cert-0.ocsp.hex" ]; then
+  OCSP_LINE="The server also attached ('stapled') a recent revocation status for its certificate."
+else
+  OCSP_LINE="No revocation status was stapled to it; the Revocation step will go and look."
+fi
+recap "The server sent $NCERTS certificate(s). A certificate is a public document that says" \
+  "'this public key belongs to this name', signed by a CA. The first one, the leaf, is" \
+  "$HOST's own; any others are CAs in between. $OCSP_LINE" \
+  "Certificates are public, so anyone could send copies of these. The next steps decide" \
+  "whether they are genuine (the chain), and section 9 decides whether the server is" \
+  "really their owner."
 
 subsection "Path building: leaf -> ... -> a root in the trust store"
 note "Each step finds a certificate whose Subject is the current one's Issuer (compared via the"
@@ -722,6 +916,24 @@ else
 fi
 EXTRA=$((NCERTS - $(echo "$USED" | wc -w | tr -d ' '))) # sent but not on the path
 [ "$EXTRA" -gt 0 ] && note "The server sent $EXTRA certificate(s) not needed for this path (cross-signs or leftovers)."
+if [ -n "$ANCHOR" ]; then
+  if [ "$ANCHOR_ON_WIRE" = 1 ]; then
+    where="The server sent the root as well, but that changes nothing: it counts only because a copy is in your trust store."
+  else
+    where="The last link, the root, came from your own trust store, not from the server."
+  fi
+  recap "The script linked $HOST's certificate to a root you trust: each certificate's" \
+    "'issuer' names the one above it, and that one's public key must verify its signature." \
+    "That gives a path of ${#CHAIN[@]} certificates. $where" \
+    "The root at the top is the 'trust anchor': the one certificate believed without proof," \
+    "because you (or your OS vendor) put it there. Everything below it is believed only" \
+    "because of the signatures. The next steps walk that path one certificate at a time."
+else
+  recap "The script could not link $HOST's certificate to any root in your trust store." \
+    "Often the server forgot to send an intermediate certificate, or the root is private" \
+    "(a company's own CA) and not in your store. Without a path, the certificate is just" \
+    "a claim anyone could have made. The next steps still examine what was sent."
+fi
 
 # Walk the path: describe each certificate and check its constraints and the
 # signature linking it to the next one up.
@@ -838,6 +1050,34 @@ while [ "$d" -lt "$NPATH" ]; do
       note "trusted only because it is in $CA."
     fi
   fi
+
+  if [ "$d" -eq 0 ] && [ "$NPATH" -eq 1 ]; then
+    recap "This is the leaf: the certificate for $HOST itself. A client checks its dates," \
+      "that it is meant for a TLS server (serverAuth), and that its subjectAltName covers" \
+      "$HOST. It should also be signed by a CA one level up, but no such CA could be found," \
+      "so that signature, the check that stops anyone from simply editing the name in a" \
+      "certificate, could not be made."
+  elif [ "$d" -eq 0 ]; then
+    recap "This is the leaf: the certificate for $HOST itself. A client checks that it is" \
+      "- inside its validity dates (expired certificates are refused outright)," \
+      "- meant for a TLS server: extended key usage includes serverAuth," \
+      "- issued for the name you typed: the subjectAltName list must cover $HOST" \
+      "  (a '*.' wildcard covers exactly one label; the old Common Name field is ignored)," \
+      "- signed by the certificate one level up: the last check above. That signature is" \
+      "  what stops anyone from simply editing the name in a certificate."
+  elif [ "$c" = "$ANCHOR" ]; then
+    recap "This is the trust anchor, the root at the top. It is signed by itself, so that" \
+      "signature proves nothing; it is believed only because it is in your trust store." \
+      "Roots usually live for 20+ years with their private keys locked offline, which is" \
+      "why they rarely sign leaf certificates directly."
+  else
+    recap "This is an intermediate CA: a root's day-to-day deputy. The root signs it once," \
+      "then goes back offline, and the intermediate signs the actual website certificates." \
+      "What makes it a CA rather than an ordinary certificate:" \
+      "- basic constraints CA:TRUE, and key usage with keyCertSign: it may sign certificates;" \
+      "- pathlen, if present: how many more CAs may sit below it." \
+      "Its own signature is checked against the next certificate up, just like the leaf's."
+  fi
   d=$((d + 1))
 done
 
@@ -853,6 +1093,7 @@ while [ "$i" -lt "$NCERTS" ]; do
 done
 REVOKED=0
 CHECKED=0
+REV_METHOD=""
 # 1) OCSP response stapled into the leaf's Certificate entry (asked for with -status).
 if [ -s "$W/cert-0.ocsp.hex" ] && [ -n "$ISSUER" ]; then
   hex2bin <"$W/cert-0.ocsp.hex" >"$W/stapled-ocsp.der"
@@ -861,11 +1102,13 @@ if [ -s "$W/cert-0.ocsp.hex" ] && [ -n "$ISSUER" ]; then
   case "$out" in *": good"*)
     pass "stapled OCSP response says: good"
     CHECKED=1
+    REV_METHOD="the status the server stapled to its certificate (signed by the CA, so the server can't forge it)"
     ;;
   *": revoked"*)
     fail "stapled OCSP response says: REVOKED"
     REVOKED=1
     CHECKED=1
+    REV_METHOD="the status the server stapled to its certificate"
     ;;
   esac
 else
@@ -880,11 +1123,13 @@ if [ -n "$OCSP_URL" ] && [ -n "$ISSUER" ] && [ "$CHECKED" = 0 ]; then
   case "$out" in *": good"*)
     pass "OCSP responder says: good"
     CHECKED=1
+    REV_METHOD="a live question to the CA's OCSP server (which tells the CA which site you are visiting)"
     ;;
   *": revoked"*)
     fail "OCSP responder says: REVOKED"
     REVOKED=1
     CHECKED=1
+    REV_METHOD="a live question to the CA's OCSP server"
     ;;
   *) note "OCSP query failed: $(echo "$out" | head -1)" ;; esac
 elif [ -z "$OCSP_URL" ]; then
@@ -901,16 +1146,33 @@ if [ -n "$CRL_URL" ] && [ "$CHECKED" = 0 ] && command -v curl >/dev/null 2>&1; t
     case "$out" in *": OK"*)
       pass "leaf is not on the CA's CRL (CRL signature verified)"
       CHECKED=1
+      REV_METHOD="downloading the CA's full revocation list (CRL) and looking for this certificate's serial number"
       ;;
     *revoked*)
       fail "leaf is REVOKED per the CRL"
       REVOKED=1
       CHECKED=1
+      REV_METHOD="the CA's revocation list (CRL)"
       ;;
     *) note "CRL check inconclusive: $(echo "$out" | grep -m1 error)" ;; esac
   else note "CRL download failed"; fi
 elif [ -n "$CRL_URL" ]; then kv "CRL" "$CRL_URL"; fi
 [ "$CHECKED" = 0 ] && warn "revocation status unknown (soft-fail, as most clients do)"
+if [ "$REVOKED" = 1 ]; then
+  REV_LINES=("This certificate HAS been revoked, according to $REV_METHOD. Its signatures"
+    "and dates are all fine, which is exactly why this separate check exists.")
+elif [ "$CHECKED" = 1 ]; then
+  REV_LINES=("This run got an answer from $REV_METHOD: not revoked.")
+else
+  REV_LINES=("This run got no answer. Most clients then connect anyway ('soft-fail'), because"
+    "refusing whenever a CA's server is slow would break much of the web. An attacker who"
+    "can block the check can therefore hide a revocation; that weakness is one reason"
+    "certificates are getting shorter lives instead.")
+fi
+recap "A CA can cancel ('revoke') a certificate before it expires, for example when its" \
+  "private key leaks. The chain checks can't notice that: a revoked certificate still has" \
+  "a perfectly valid signature. So the client has to ask separately." \
+  "${REV_LINES[@]}"
 
 subsection "Certificate Transparency"
 note "Chrome and Safari require SCTs (signed promises from public CT logs that the certificate"
@@ -920,6 +1182,11 @@ if [ "${nsct:-0}" -gt 0 ]; then
   grep -E '^ +Timestamp *:' "$W/text.0" | sed -E 's/^ +Timestamp *: */logged at /' | while read -r l; do kv "SCT" "$l"; done
   pass "$nsct embedded SCT(s)"
 else warn "no embedded SCTs (normal for private CAs; public certs could also deliver them in TLS or OCSP)"; fi
+recap "Certificate Transparency (CT) logs are public, append-only lists of every certificate" \
+  "the public CAs issue. Each SCT above is a log's signed receipt for this certificate." \
+  "CT doesn't stop a CA from issuing a certificate for $HOST to the wrong person; it" \
+  "makes that impossible to do secretly, because the domain owner can watch the logs" \
+  "for certificates bearing their name. Browsers refuse public certificates that lack SCTs."
 
 subsection "Cross-check: OpenSSL's own path validation"
 note "openssl verify runs the full RFC 5280 algorithm, including unknown critical extensions,"
@@ -931,6 +1198,12 @@ echo "$out" | sed "s|$W/||g; s/^/     /"
 case "$out" in *"chain-0.pem: OK"*) pass "openssl verify: OK" ;; *) fail "openssl verify rejected the chain" ;; esac
 VRC=$(grep -m1 'Verify return code' "$W/s_client.txt" | sed 's/^ *//')
 case "$VRC" in *"0 (ok)"*) pass "s_client during the handshake: $VRC" ;; *) fail "s_client during the handshake: $VRC" ;; esac
+recap "Two independent opinions on the same chain: OpenSSL's full implementation of the" \
+  "standard path-validation algorithm, and the verdict s_client reached live, during the" \
+  "handshake. They should agree with the hand checks above. If OpenSSL rejects something" \
+  "the hand checks passed, the reason is in its error line: the hand checks are a" \
+  "simplified version, written to be readable rather than complete. (Neither of these" \
+  "two checks revocation.)"
 
 # =============================================================================
 # Transcript helpers for the next steps. The transcript is every handshake
@@ -1034,6 +1307,13 @@ if [ -n "$CV" ]; then
 else
   fail "no CertificateVerify captured"
 fi
+recap "Section 8 showed the certificate is genuine. It didn't show that the server you are" \
+  "connected to owns it: certificates are public, so anyone can send a copy." \
+  "Here the server signed a fingerprint (hash) of this very handshake, which includes" \
+  "the client's fresh random value, using the private key that matches the leaf." \
+  "Only the key's owner can make that signature, and because it covers this handshake's" \
+  "random value it can't be copied from an earlier connection." \
+  "Genuine certificate for $HOST + proof of owning its key = you are talking to $HOST."
 
 # =============================================================================
 # Finished: transcript integrity + key confirmation
@@ -1073,6 +1353,14 @@ if [ "$HAVE_KDF" = 1 ] && [ -s "$W/keylog.txt" ]; then
 else
   skip "Finished recomputation needs OpenSSL 3.x ('openssl kdf') and a key log"
 fi
+recap "Each side ends its part of the handshake with Finished: a keyed fingerprint (MAC) of" \
+  "every handshake message it sent and received, made with a key from the secrets of" \
+  "section 6. The script recomputed both from the recorded bytes. A match means:" \
+  "- both sides saw byte-for-byte the same handshake. If an attacker had altered anything" \
+  "  in transit, say deleting the strong options from the ClientHello to force a weak" \
+  "  one, the fingerprints would differ and the connection would be dropped;" \
+  "- both derived the same keys, so the encrypted channel really works both ways." \
+  "Only after checking the server's Finished does the client send its HTTP request."
 
 # =============================================================================
 # NewSessionTicket + application data
@@ -1098,6 +1386,14 @@ if [ "$NT" -gt 0 ]; then
   note "session state encrypted with a key only the server knows (a STEK). The client stores it next"
   note "to a PSK derived from the resumption master secret. RFC 8446 caps lifetimes at 7 days."
 else note "No session tickets received."; fi
+if [ "$NT" -gt 0 ]; then
+  TICKET_LINE="The server also handed over $NT session ticket(s): like a cloakroom ticket, it means nothing to the client, but the server can turn it back into this session's state. The next section uses one."
+else
+  TICKET_LINE="The server sent no session tickets, so the next section has nothing to resume with."
+fi
+recap "The handshake is over, and the actual HTTP exchange travelled under the application" \
+  "keys: ${resp:-no HTTP response line was captured}." \
+  "$TICKET_LINE"
 
 # =============================================================================
 # Resumption
@@ -1124,11 +1420,22 @@ if [ -s "$W/session.pem" ]; then
     else warn "resumed, but certificates were still sent"; fi
     note "Authentication carries over from the original handshake via the PSK. In psk_dhe_ke mode"
     note "a fresh ECDHE still runs, so the resumed session keeps forward secrecy."
+    recap "A second, real connection, opened with the ticket from section 11. Compare its table" \
+      "with section 3's: no Certificate, no CertificateVerify. The ticket (pre_shared_key in" \
+      "the ClientHello) let the server recognise the client as the one it already" \
+      "authenticated, so the certificate checks, the most expensive part, were skipped." \
+      "New key shares were still exchanged, so this session gets keys of its own."
   else
     warn "server did not accept the ticket (full handshake instead)"
+    recap "A second connection offered the ticket from section 11, but the server ignored it" \
+      "and did a full handshake. That is allowed and common, for example when a load" \
+      "balancer sends the second connection to a different machine that can't read the" \
+      "ticket. The client loses nothing but time."
   fi
 else
   skip "no session ticket saved"
+  recap "Without a ticket from the first connection there is nothing to resume, so this" \
+    "step was skipped. Servers aren't required to send tickets."
 fi
 
 # =============================================================================
@@ -1139,11 +1446,21 @@ if command -v curl >/dev/null 2>&1; then
   CURL_ARGS=(-sS -o /dev/null --noproxy '*' --tlsv1.3 --cacert "$CA" --max-time "$TIMEOUT"
     -w '%{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}\n')
   [ "$CONNECT_TO" != "$HOST:$PORT" ] && CURL_ARGS+=(--connect-to "$HOST:$PORT:$CHOST:$CPORT")
+  # macOS's own curl (SecureTransport) has no --tlsv1.3 (exit 4): drop the flag.
+  curl "${CURL_ARGS[@]}" "https://$HOST:$PORT/" >/dev/null 2>&1
+  if [ $? -eq 4 ]; then
+    a=()
+    for x in "${CURL_ARGS[@]}"; do [ "$x" = --tlsv1.3 ] || a+=("$x"); done
+    CURL_ARGS=("${a[@]}")
+    note "(this curl can't insist on TLS 1.3, so it uses whatever version it negotiates)"
+  fi
+  TIMED=0
   for run in 1 2 3; do
     t=$(curl "${CURL_ARGS[@]}" "https://$HOST:$PORT/" 2>/dev/null) || {
       note "curl failed"
       break
     }
+    TIMED=$((TIMED + 1))
     echo "$t" | awk -v r="$run" '{ printf "     run %s: DNS %6.1f ms | TCP %6.1f ms | TLS %6.1f ms | to first byte %6.1f ms\n", r, $1*1000, ($2-$1)*1000, ($3-$2)*1000, ($4-$3)*1000 }'
   done
   note "TCP connect is about one RTT. A full TLS 1.3 handshake is about one more RTT plus well"
@@ -1151,6 +1468,17 @@ if command -v curl >/dev/null 2>&1; then
   note "(Each curl run is a fresh process, so it does a full handshake every time.)"
 else
   skip "curl not installed"
+  TIMED=0
+fi
+if [ "$TIMED" -gt 0 ]; then
+  recap "$TIMED fresh connection(s), timed by curl. Compare the TCP and TLS columns: each is" \
+    "about one round trip across the network, so they should be close. TLS 1.3 costs" \
+    "roughly one extra round trip, and nearly all of that is waiting for the network:" \
+    "the cryptography this walkthrough re-did by hand takes well under a millisecond."
+else
+  recap "No timings this run. Had they worked, the TCP and TLS columns would each show about" \
+    "one network round trip: TLS 1.3 adds roughly one round trip to a connection, and the" \
+    "cryptography re-done by hand in this walkthrough takes well under a millisecond."
 fi
 
 # =============================================================================
@@ -1167,4 +1495,14 @@ echo
 note "Artifacts in $W:"
 note "  chain-N.pem (as sent), store/ (trust store, split), msg.log (raw handshake),"
 note "  keylog.txt (session secrets: delete when done), s_client.txt, *.tsv (parsed)"
+if [ "$nf" -eq 0 ]; then
+  VERDICT="Every check passed: a careful client would trust this connection to $HOST."
+else
+  VERDICT="$nf check(s) failed: a careful client would have refused this connection to $HOST."
+fi
+recap_text "$VERDICT" \
+  "To see what failures look like, try a test site that is broken on purpose:" \
+  "- $0 expired-isrgrootx1.letsencrypt.org" \
+  "- $0 revoked-isrgrootx1.letsencrypt.org" \
+  "More are listed in the comment at the top of this script."
 [ "$nf" -eq 0 ] && exit 0 || exit 1
