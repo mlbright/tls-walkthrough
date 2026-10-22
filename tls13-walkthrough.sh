@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT  (Copyright (c) 2026 Martin-Louis Bright; see LICENSE)
 # =============================================================================
 # tls13-walkthrough.sh — take one real TLS 1.3 handshake apart, message by
 # message, and re-do the security checks by hand.
